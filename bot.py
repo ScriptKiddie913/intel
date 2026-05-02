@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -71,6 +72,8 @@ MAX_TEXT_LENGTH = 4096
 API_RETRY_ATTEMPTS = 3
 API_RETRY_BASE_DELAY = 1.5
 DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "3600"))
+HEALTHCHECK_PORT = int(os.getenv("PORT", os.getenv("HEALTHCHECK_PORT", "10000")))
+HEALTHCHECK_HOST = os.getenv("HEALTHCHECK_HOST", "0.0.0.0")
 
 
 if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_SESSION or not SOURCE_CHANNEL or not DEST_CHANNEL:
@@ -399,6 +402,47 @@ async def process_message(client: TelegramClient, event: events.NewMessage.Event
         raise
 
 
+async def healthcheck_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        data = await reader.read(1024)
+        request_line = data.splitlines()[0].decode("utf-8", errors="ignore") if data else ""
+        path = "/"
+        parts = request_line.split(" ")
+        if len(parts) >= 2:
+            path = parts[1]
+
+        if path == "/health":
+            body = "ok"
+            status = "HTTP/1.1 200 OK"
+        else:
+            body = "telegram-intel-bot"
+            status = "HTTP/1.1 200 OK"
+
+        response = (
+            f"{status}\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            f"{body}"
+        )
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+    except Exception:
+        logger.exception("Healthcheck handler error")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def run_healthcheck_server() -> None:
+    server = await asyncio.start_server(healthcheck_handler, HEALTHCHECK_HOST, HEALTHCHECK_PORT)
+    sockets = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    logger.info("Healthcheck server listening on %s", sockets)
+    async with server:
+        await server.serve_forever()
+
+
 async def main() -> None:
     client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID_INT, TELEGRAM_API_HASH)
 
@@ -412,7 +456,13 @@ async def main() -> None:
     logger.info("Starting Telegram client")
     await client.start()
     logger.info("Bot is running. Source=%s Destination=%s", SOURCE_CHANNEL, DEST_CHANNEL)
-    await client.run_until_disconnected()
+    health_task = asyncio.create_task(run_healthcheck_server())
+    try:
+        await client.run_until_disconnected()
+    finally:
+        health_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await health_task
 
 
 if __name__ == "__main__":
