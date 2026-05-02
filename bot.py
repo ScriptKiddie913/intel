@@ -32,6 +32,7 @@ logger = logging.getLogger("telegram_intel_bot")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 DEST_CHANNEL = os.getenv("DEST_CHANNEL", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -76,9 +77,9 @@ HEALTHCHECK_PORT = int(os.getenv("PORT", os.getenv("HEALTHCHECK_PORT", "10000"))
 HEALTHCHECK_HOST = os.getenv("HEALTHCHECK_HOST", "0.0.0.0")
 
 
-if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_SESSION or not SOURCE_CHANNEL or not DEST_CHANNEL:
+if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or (not TELEGRAM_SESSION and not BOT_TOKEN) or not SOURCE_CHANNEL or not DEST_CHANNEL:
     raise RuntimeError(
-        "Missing required Telegram configuration. Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, SOURCE_CHANNEL, and DEST_CHANNEL."
+        "Missing required Telegram configuration. Set TELEGRAM_API_ID, TELEGRAM_API_HASH, SOURCE_CHANNEL, DEST_CHANNEL, and either TELEGRAM_SESSION or BOT_TOKEN."
     )
 
 if not OPENROUTER_API_KEY:
@@ -88,6 +89,34 @@ try:
     TELEGRAM_API_ID_INT = int(TELEGRAM_API_ID)
 except ValueError as exc:
     raise RuntimeError("TELEGRAM_API_ID must be an integer.") from exc
+
+
+def parse_source_channel_value(raw_value: str) -> tuple[set[int], set[str]]:
+    numeric_ids: set[int] = set()
+    usernames: set[str] = set()
+
+    for part in (item.strip() for item in raw_value.split(",")):
+        if not part:
+            continue
+        cleaned = part.lstrip("@").strip()
+        try:
+            numeric_ids.add(int(cleaned))
+        except ValueError:
+            usernames.add(cleaned.lower())
+
+    return numeric_ids, usernames
+
+
+def parse_destination_channel_value(raw_value: str) -> int | str:
+    cleaned = raw_value.strip().lstrip("@").strip()
+    try:
+        return int(cleaned)
+    except ValueError:
+        return cleaned
+
+
+SOURCE_CHANNEL_IDS, SOURCE_CHANNEL_USERNAMES = parse_source_channel_value(SOURCE_CHANNEL)
+DEST_CHANNEL_ENTITY = parse_destination_channel_value(DEST_CHANNEL)
 
 
 @dataclass
@@ -331,7 +360,7 @@ def split_text_for_telegram(text: str, max_length: int = MAX_TEXT_LENGTH) -> Lis
 async def send_text_chunks(client: TelegramClient, text: str) -> None:
     chunks = split_text_for_telegram(text, MAX_TEXT_LENGTH)
     for chunk in chunks:
-        await client.send_message(DEST_CHANNEL, chunk)
+        await client.send_message(DEST_CHANNEL_ENTITY, chunk)
 
 
 async def post_to_destination(client: TelegramClient, source_message: Any, caption: str) -> None:
@@ -346,7 +375,7 @@ async def post_to_destination(client: TelegramClient, source_message: Any, capti
 
             if len(caption) <= MAX_CAPTION_LENGTH:
                 await client.send_file(
-                    DEST_CHANNEL,
+                    DEST_CHANNEL_ENTITY,
                     file_path,
                     caption=caption,
                     force_document=True,
@@ -354,7 +383,7 @@ async def post_to_destination(client: TelegramClient, source_message: Any, capti
             else:
                 prefix = caption[:MAX_CAPTION_LENGTH]
                 await client.send_file(
-                    DEST_CHANNEL,
+                    DEST_CHANNEL_ENTITY,
                     file_path,
                     caption=prefix,
                     force_document=True,
@@ -444,18 +473,48 @@ async def run_healthcheck_server() -> None:
 
 
 async def main() -> None:
-    client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID_INT, TELEGRAM_API_HASH)
+    if BOT_TOKEN:
+        client = TelegramClient(StringSession(), TELEGRAM_API_ID_INT, TELEGRAM_API_HASH)
+    else:
+        client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID_INT, TELEGRAM_API_HASH)
 
-    @client.on(events.NewMessage(chats=SOURCE_CHANNEL))
+    async def log_raw_update(update: Any) -> None:
+        logger.info("RAW UPDATE: %s", update)
+
+    client.add_event_handler(log_raw_update, events.Raw())
+
+    @client.on(events.NewMessage(incoming=True))
     async def handler(event: events.NewMessage.Event) -> None:
         try:
+            if event.chat_id is None:
+                return
+
+            if SOURCE_CHANNEL_IDS or SOURCE_CHANNEL_USERNAMES:
+                if event.chat_id in SOURCE_CHANNEL_IDS:
+                    await process_message(client, event)
+                    return
+
+                chat = await event.get_chat()
+                username = (getattr(chat, "username", None) or "").lower()
+                if username not in SOURCE_CHANNEL_USERNAMES:
+                    return
+
             await process_message(client, event)
         except Exception:
             logger.exception("Failed to process message %s", event.message.id)
 
     logger.info("Starting Telegram client")
-    await client.start()
-    logger.info("Bot is running. Source=%s Destination=%s", SOURCE_CHANNEL, DEST_CHANNEL)
+    if BOT_TOKEN:
+        await client.start(bot_token=BOT_TOKEN)
+    else:
+        await client.start()
+    logger.info(
+        "Bot is running. Source=%s Destination=%s | source_ids=%s | source_usernames=%s",
+        SOURCE_CHANNEL,
+        DEST_CHANNEL,
+        sorted(SOURCE_CHANNEL_IDS),
+        sorted(SOURCE_CHANNEL_USERNAMES),
+    )
     health_task = asyncio.create_task(run_healthcheck_server())
     try:
         await client.run_until_disconnected()
